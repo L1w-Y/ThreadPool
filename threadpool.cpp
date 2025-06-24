@@ -2,29 +2,60 @@
 #include <functional>
 #include <iostream>
 #include "Thread.h"
-const int TASK_MAX_THREADHOLD = 3;
+constexpr int TASK_MAX_THRESHOLD = 1024;
+constexpr int THREAD_MAX_IDLE_TIME = 10;
 
 Threadpool::Threadpool():initThreadSize_(4)
 						,taskSize_(0)
-						,maxTaskSizeThreadHold_(TASK_MAX_THREADHOLD)
-						,mode_(PoolMode::MODE_FIXED)	
+						,maxTaskSizeThreadHold_(TASK_MAX_THRESHOLD)
+						,mode_(PoolMode::MODE_FIXED)
+						,isPoolRunning_(false)
+						, idleThreadSize_(0)
+						,threadSizeHold_(300)
 {
 	
 }
-Threadpool::~Threadpool(){}
+Threadpool::~Threadpool()
+{
+	isPoolRunning_ = false;
+
+	std::unique_lock<std::mutex> lock(taskQueMtx_);
+	exitCond_.wait(lock, [&]
+	{
+		return threads_.empty();
+	});
+
+}
 
 //设置工作模式
 void Threadpool::setMode(const PoolMode mode)
 {
+	if (checkRunningState())
+	{
+		return;
+	}
 	mode_ = mode;
 }
+
+bool Threadpool::checkRunningState() const
+{
+	return isPoolRunning_;
+}
+
+void Threadpool::setThreadSizeHold(const int size)
+{
+	if (checkRunningState()) return;
+	if (mode_ == PoolMode::MODE_CACHED) threadSizeHold_ = size;
+}
+
 //设置任务上限
 void Threadpool::setMaxTaskSizeThreadHold(int threadhold)
 {
 	maxTaskSizeThreadHold_ = threadhold;
 }
+
 //提交任务
-void Threadpool::submitTask(const std::shared_ptr<Task> &task)
+std::shared_ptr<Result> Threadpool::submitTask(const std::shared_ptr<Task> &task)
 {
 	//获取锁
 	std::unique_lock<std::mutex> lock(taskQueMtx_);
@@ -33,45 +64,103 @@ void Threadpool::submitTask(const std::shared_ptr<Task> &task)
 		[&]{return taskQue_.size() < static_cast<size_t>(maxTaskSizeThreadHold_); }))
 	{
 		std::cout << "task queue is full,submit task fail\n";
-		return;
+		return std::make_shared<Result>(task,false);
 	}
 	//有空间，就放入
 	taskQue_.emplace(task);
+	auto result = std::make_shared<Result>(task);
+	task->setResult(result);
 	++taskSize_;
 	//通知
 	notEmpty_.notify_all();
+	if (mode_==PoolMode::MODE_CACHED
+		&& taskSize_ >idleThreadSize_
+		&&curThreadSize_<threadSizeHold_)
+	{
+		auto ptr = std::make_unique<Thread>(
+			[this](int threadid) { this->threadFunc(threadid); }
+		);
+		int threadid = ptr->getId();
+		threads_.emplace(threadid, std::move(ptr));
+		threads_[threadid]->start();
+		std::cout << "创建新线程\n";
+		++curThreadSize_;
+		++idleThreadSize_;
+	}
+	return result;
 }
+
 //开起线程池
 void Threadpool::start(int initSize)
 {
+	isPoolRunning_ = true;
 	initThreadSize_ = initSize;
+	curThreadSize_ = initSize;
 	//创建线程对象
 	for (size_t i = 0;i<initThreadSize_;++i)
 	{
-		threads_.emplace_back(std::make_unique<Thread>([this]() {
-			this->threadFunc();
-			}));
+		auto ptr = std::make_unique<Thread>(
+			[this](int threadid) { this->threadFunc(threadid); }
+		);
+		int threadid = ptr->getId();
+		threads_.emplace(threadid, std::move(ptr));
 	}
 
 	for (size_t i = 0;i<initThreadSize_;++i)
 	{
 		threads_[i]->start();
+		++idleThreadSize_;
 	}
 }
 
-
 //绑定给线程池中的线程作为线程函数，从任务队列中消费任务
-void Threadpool::threadFunc()
+void Threadpool::threadFunc(int threadid)
 {
-	for (;;)
+	auto lastTime = std::chrono::high_resolution_clock().now();
+	while (isPoolRunning_)
 	{
 		std::shared_ptr<Task> task;
 		{
 			std::cout << "tid:" << std::this_thread::get_id() << " 尝试获取任务\n";
 			//获取锁
 			std::unique_lock<std::mutex> lock(taskQueMtx_);
-			//等待notEmpty条件
-			notEmpty_.wait(lock, [&]{return !taskQue_.empty(); });
+
+			while (taskQue_.empty())
+			{
+				if (mode_ == PoolMode::MODE_CACHED)
+				{
+					if (std::cv_status::timeout ==
+						notEmpty_.wait_for(lock, std::chrono::seconds(1)))
+					{
+						auto now = std::chrono::high_resolution_clock().now();
+						auto dur = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime);
+						if (dur.count() >= THREAD_MAX_IDLE_TIME
+							&& curThreadSize_ > initThreadSize_)
+						{
+							//回收当前线程
+							threads_.erase(threadid);
+							--curThreadSize_;
+							--idleThreadSize_;
+							std::cout << "线程:" << std::this_thread::get_id() << " 被回收\n";
+							return;
+						}
+					}
+				}
+				else
+				{
+					//等待notEmpty条件
+					notEmpty_.wait(lock);
+				}
+				if (!isPoolRunning_)
+				{
+					threads_.erase(threadid);
+					--curThreadSize_;
+					std::cout << "线程:" << std::this_thread::get_id() << " 被回收\n";
+					exitCond_.notify_all();
+					return;
+				}
+			}
+			--idleThreadSize_;
 			//不空就取任务
 			task = taskQue_.front();
 			taskQue_.pop();
@@ -85,14 +174,18 @@ void Threadpool::threadFunc()
 			//取出了任务需要通知
 			notFull_.notify_all();
 		}
-		
 		//当前线程执行任务
 		if (task != nullptr) {
-			task->run();
+			task->exec();
 			std::cout << "tid:" << std::this_thread::get_id() << "任务执行完成\n";
 		}
+		lastTime = std::chrono::high_resolution_clock().now();
+		++idleThreadSize_;
 	}
-
+	threads_.erase(threadid);
+	--curThreadSize_;
+	std::cout << "线程:" << std::this_thread::get_id() << " 被回收\n";
+	exitCond_.notify_all();
 }
 
 
