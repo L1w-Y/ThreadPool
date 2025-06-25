@@ -20,11 +20,11 @@ Threadpool::~Threadpool()
 	isPoolRunning_ = false;
 
 	std::unique_lock<std::mutex> lock(taskQueMtx_);
+	notEmpty_.notify_all();
 	exitCond_.wait(lock, [&]
 	{
 		return threads_.empty();
 	});
-
 }
 
 //设置工作模式
@@ -117,7 +117,7 @@ void Threadpool::start(int initSize)
 void Threadpool::threadFunc(int threadid)
 {
 	auto lastTime = std::chrono::high_resolution_clock().now();
-	while (isPoolRunning_)
+	for (;;)
 	{
 		std::shared_ptr<Task> task;
 		{
@@ -125,8 +125,16 @@ void Threadpool::threadFunc(int threadid)
 			//获取锁
 			std::unique_lock<std::mutex> lock(taskQueMtx_);
 
-			while (taskQue_.empty())
+			while(taskQue_.empty())
 			{
+				if (!isPoolRunning_)
+				{
+					threads_.erase(threadid);
+					--curThreadSize_;
+					std::cout << "线程:" << std::this_thread::get_id() << " 被回收\n";
+					exitCond_.notify_all();
+					return;
+				}
 				if (mode_ == PoolMode::MODE_CACHED)
 				{
 					if (std::cv_status::timeout ==
@@ -151,14 +159,6 @@ void Threadpool::threadFunc(int threadid)
 					//等待notEmpty条件
 					notEmpty_.wait(lock);
 				}
-				if (!isPoolRunning_)
-				{
-					threads_.erase(threadid);
-					--curThreadSize_;
-					std::cout << "线程:" << std::this_thread::get_id() << " 被回收\n";
-					exitCond_.notify_all();
-					return;
-				}
 			}
 			--idleThreadSize_;
 			//不空就取任务
@@ -182,10 +182,6 @@ void Threadpool::threadFunc(int threadid)
 		lastTime = std::chrono::high_resolution_clock().now();
 		++idleThreadSize_;
 	}
-	threads_.erase(threadid);
-	--curThreadSize_;
-	std::cout << "线程:" << std::this_thread::get_id() << " 被回收\n";
-	exitCond_.notify_all();
 }
 
 

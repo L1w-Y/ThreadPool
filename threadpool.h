@@ -25,7 +25,7 @@ public:
 	//设置工作模式
 	void setMode(PoolMode mode);
 	//开起线程池
-	void start(int initSize=4);
+	void start(int initSize = std::thread::hardware_concurrency());
 	//设置任务上限
 	void setMaxTaskSizeThreadHold(int threadhold);
 	//提交任务
